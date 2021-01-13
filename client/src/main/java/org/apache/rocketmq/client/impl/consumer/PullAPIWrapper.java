@@ -97,13 +97,14 @@ public class PullAPIWrapper {
 
             for (MessageExt msg : msgListFilterAgain) {
                 String traFlag = msg.getProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED);
-                if (traFlag != null && Boolean.parseBoolean(traFlag)) {
+                if (Boolean.parseBoolean(traFlag)) {
                     msg.setTransactionId(msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX));
                 }
                 MessageAccessor.putProperty(msg, MessageConst.PROPERTY_MIN_OFFSET,
                     Long.toString(pullResult.getMinOffset()));
                 MessageAccessor.putProperty(msg, MessageConst.PROPERTY_MAX_OFFSET,
                     Long.toString(pullResult.getMaxOffset()));
+                msg.setBrokerName(mq.getBrokerName());
             }
 
             pullResultExt.setMsgFoundList(msgListFilterAgain);
@@ -213,7 +214,7 @@ public class PullAPIWrapper {
             // 从 FilterServer 上拉取消息
             // 注释6.4
             if (PullSysFlag.hasClassFilterFlag(sysFlagInner)) {
-                brokerAddr = computPullFromWhichFilterServer(mq.getTopic(), brokerAddr);
+                brokerAddr = computePullFromWhichFilterServer(mq.getTopic(), brokerAddr);
             }
 
             PullResult pullResult = this.mQClientFactory.getMQClientAPIImpl().pullMessage(
@@ -242,7 +243,7 @@ public class PullAPIWrapper {
         return MixAll.MASTER_ID;
     }
 
-    private String computPullFromWhichFilterServer(final String topic, final String brokerAddr)
+    private String computePullFromWhichFilterServer(final String topic, final String brokerAddr)
         throws MQClientException {
         ConcurrentMap<String, TopicRouteData> topicRouteTable = this.mQClientFactory.getTopicRouteTable();
         if (topicRouteTable != null) {

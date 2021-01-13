@@ -29,6 +29,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+
 import org.apache.rocketmq.client.consumer.DefaultMQPushConsumer;
 import org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyContext;
 import org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyStatus;
@@ -39,32 +40,25 @@ import org.apache.rocketmq.client.log.ClientLogger;
 import org.apache.rocketmq.client.stat.ConsumerStatsManager;
 import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.common.ThreadFactoryImpl;
-import org.apache.rocketmq.logging.InternalLogger;
 import org.apache.rocketmq.common.message.MessageAccessor;
-import org.apache.rocketmq.common.message.MessageConst;
 import org.apache.rocketmq.common.message.MessageExt;
 import org.apache.rocketmq.common.message.MessageQueue;
 import org.apache.rocketmq.common.protocol.body.CMResult;
 import org.apache.rocketmq.common.protocol.body.ConsumeMessageDirectlyResult;
+import org.apache.rocketmq.common.utils.ThreadUtils;
+import org.apache.rocketmq.logging.InternalLogger;
 import org.apache.rocketmq.remoting.common.RemotingHelper;
 
 public class ConsumeMessageConcurrentlyService implements ConsumeMessageService {
     private static final InternalLogger log = ClientLogger.getLog();
-    // 注释5.6：消息推模式实现类
     private final DefaultMQPushConsumerImpl defaultMQPushConsumerImpl;
-    // 注释5.6：消费者对象
     private final DefaultMQPushConsumer defaultMQPushConsumer;
-    // 注释5.6：并发消息业务事件类
     private final MessageListenerConcurrently messageListener;
-    // 注释5.6：消息消费任务队列
     private final BlockingQueue<Runnable> consumeRequestQueue;
-    // 注释5.6：消息消费线程池
     private final ThreadPoolExecutor consumeExecutor;
-    // 注释5.6：消费组
     private final String consumerGroup;
-    // 注释5.6：添加消费任务到延迟调度器
+
     private final ScheduledExecutorService scheduledExecutorService;
-    // 注释5.6：定时删除过期消息线程池
     private final ScheduledExecutorService cleanExpireMsgExecutors;
 
     public ConsumeMessageConcurrentlyService(DefaultMQPushConsumerImpl defaultMQPushConsumerImpl,
@@ -99,9 +93,9 @@ public class ConsumeMessageConcurrentlyService implements ConsumeMessageService 
         }, this.defaultMQPushConsumer.getConsumeTimeout(), this.defaultMQPushConsumer.getConsumeTimeout(), TimeUnit.MINUTES);
     }
 
-    public void shutdown() {
+    public void shutdown(long awaitTerminateMillis) {
         this.scheduledExecutorService.shutdown();
-        this.consumeExecutor.shutdown();
+        ThreadUtils.shutdownGracefully(this.consumeExecutor, awaitTerminateMillis, TimeUnit.MILLISECONDS);
         this.cleanExpireMsgExecutors.shutdown();
     }
 
@@ -164,7 +158,7 @@ public class ConsumeMessageConcurrentlyService implements ConsumeMessageService 
 
         ConsumeConcurrentlyContext context = new ConsumeConcurrentlyContext(mq);
 
-        this.resetRetryTopic(msgs);
+        this.defaultMQPushConsumerImpl.resetRetryAndNamespace(msgs, this.consumerGroup);
 
         final long beginTime = System.currentTimeMillis();
 
@@ -204,7 +198,6 @@ public class ConsumeMessageConcurrentlyService implements ConsumeMessageService 
         return result;
     }
 
-    // 注释5.6.1：消息消费
     @Override
     public void submitConsumeRequest(
         final List<MessageExt> msgs,
@@ -217,11 +210,9 @@ public class ConsumeMessageConcurrentlyService implements ConsumeMessageService 
             try {
                 this.consumeExecutor.submit(consumeRequest);
             } catch (RejectedExecutionException e) {
-                // 注释5.6.1：消息提交错误，之后5s再提交，但是由于使用的 LinkedBlockingQueue 无界队列，故不会出现拒绝提交异常
                 this.submitConsumeRequestLater(consumeRequest);
             }
         } else {
-            // 注释5.6.1：拉取消息分页拉取
             for (int total = 0; total < msgs.size(); ) {
                 List<MessageExt> msgThis = new ArrayList<MessageExt>(consumeBatchSize);
                 for (int i = 0; i < consumeBatchSize; i++, total++) {
@@ -246,15 +237,6 @@ public class ConsumeMessageConcurrentlyService implements ConsumeMessageService 
         }
     }
 
-    public void resetRetryTopic(final List<MessageExt> msgs) {
-        final String groupTopic = MixAll.getRetryTopic(consumerGroup);
-        for (MessageExt msg : msgs) {
-            String retryTopic = msg.getProperty(MessageConst.PROPERTY_RETRY_TOPIC);
-            if (retryTopic != null && groupTopic.equals(msg.getTopic())) {
-                msg.setTopic(retryTopic);
-            }
-        }
-    }
 
     private void cleanExpireMsg() {
         Iterator<Map.Entry<MessageQueue, ProcessQueue>> it =
@@ -336,6 +318,8 @@ public class ConsumeMessageConcurrentlyService implements ConsumeMessageService 
     public boolean sendMessageBack(final MessageExt msg, final ConsumeConcurrentlyContext context) {
         int delayLevel = context.getDelayLevelWhenNextConsume();
 
+        // Wrap topic with namespace before sending back message.
+        msg.setTopic(this.defaultMQPushConsumer.withNamespace(msg.getTopic()));
         try {
             this.defaultMQPushConsumerImpl.sendMessageBack(msg, delayLevel, context.getMessageQueue().getBrokerName());
             return true;
@@ -403,11 +387,13 @@ public class ConsumeMessageConcurrentlyService implements ConsumeMessageService 
             MessageListenerConcurrently listener = ConsumeMessageConcurrentlyService.this.messageListener;
             ConsumeConcurrentlyContext context = new ConsumeConcurrentlyContext(messageQueue);
             ConsumeConcurrentlyStatus status = null;
+            defaultMQPushConsumerImpl.resetRetryAndNamespace(msgs, defaultMQPushConsumer.getConsumerGroup());
 
             ConsumeMessageContext consumeMessageContext = null;
             // 注释5.6.1：执行钩子方法
             if (ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.hasHook()) {
                 consumeMessageContext = new ConsumeMessageContext();
+                consumeMessageContext.setNamespace(defaultMQPushConsumer.getNamespace());
                 consumeMessageContext.setConsumerGroup(defaultMQPushConsumer.getConsumerGroup());
                 consumeMessageContext.setProps(new HashMap<String, String>());
                 consumeMessageContext.setMq(messageQueue);
@@ -421,7 +407,6 @@ public class ConsumeMessageConcurrentlyService implements ConsumeMessageService 
             ConsumeReturnType returnType = ConsumeReturnType.SUCCESS;
             try {
                 // 注释5.6.1：消息重试主题，即 SCHEDULE_TOPIC
-                ConsumeMessageConcurrentlyService.this.resetRetryTopic(msgs);
                 if (msgs != null && !msgs.isEmpty()) {
                     for (MessageExt msg : msgs) {
                         MessageAccessor.setConsumeStartTimeStamp(msg, String.valueOf(System.currentTimeMillis()));
